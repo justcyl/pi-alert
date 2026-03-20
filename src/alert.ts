@@ -354,7 +354,7 @@ export function buildAlertMessage(summary: AlertSummaryInput): string {
   const readFileCount = summary.readPaths.length > 0 ? summary.readPaths.length : summary.readCount
 
   if (writeFileCount > 0) {
-    return `${describeFileActivity("Updated", summary.writtenPaths, writeFileCount)}${durationSuffix}`
+    return `${describeFileActivity("Updated", writeFileCount)}${durationSuffix}`
   }
 
   if (summary.otherToolCalls.length > 0) {
@@ -362,17 +362,13 @@ export function buildAlertMessage(summary: AlertSummaryInput): string {
   }
 
   if (readFileCount > 0) {
-    return `${describeFileActivity("Read", summary.readPaths, readFileCount)}${durationSuffix}`
+    return `${describeFileActivity("Read", readFileCount)}${durationSuffix}`
   }
 
   return durationSuffix ? `Finished${durationSuffix}` : FALLBACK_MESSAGE
 }
 
-function describeFileActivity(verb: string, paths: string[], count: number): string {
-  if (paths.length === 1) {
-    return `${verb} ${paths[0]}`
-  }
-
+function describeFileActivity(verb: string, count: number): string {
   return `${verb} ${count} ${count === 1 ? "file" : "files"}`
 }
 

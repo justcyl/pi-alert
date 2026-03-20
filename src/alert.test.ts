@@ -124,7 +124,7 @@ describe("buildAlertMessage", () => {
         readPaths: ["README.md", "package.json"],
         otherToolCalls: ["bash", "grep"],
       }),
-    ).toBe("Updated src/alert.ts in 1.3s")
+    ).toBe("Updated 1 file in 1.3s")
   })
 
   test("summarizes other tool calls when nothing was written", () => {
