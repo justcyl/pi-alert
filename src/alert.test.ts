@@ -1,0 +1,253 @@
+import { describe, expect, test } from "bun:test"
+import {
+  buildAlertMessage,
+  buildNotificationCommands,
+  buildOsc777Sequence,
+  buildOsc99Sequences,
+  buildTerminalNotificationSequences,
+  buildWindowsNotificationScript,
+  detectTerminalNotificationTransport,
+  escapeAppleScriptString,
+  escapePowerShellString,
+  formatDuration,
+  mergeAlertSummaries,
+  sanitizeTerminalNotificationText,
+  sendTerminalNotification,
+  summarizeAgentEndMessages,
+} from "./alert"
+
+describe("terminal notifications", () => {
+  test("detects OSC 777 terminals", () => {
+    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "ghostty" }, true)).toBe("osc777")
+    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "iTerm.app" }, true)).toBe("osc777")
+    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "WezTerm" }, true)).toBe("osc777")
+    expect(detectTerminalNotificationTransport({ TERM: "rxvt-unicode-256color" }, true)).toBe("osc777")
+  })
+
+  test("detects Kitty", () => {
+    expect(detectTerminalNotificationTransport({ KITTY_WINDOW_ID: "12" }, true)).toBe("osc99")
+  })
+
+  test("returns null when stdout is not a tty or terminal is unsupported", () => {
+    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "ghostty" }, false)).toBeNull()
+    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "Apple_Terminal" }, true)).toBeNull()
+  })
+
+  test("sanitizes terminal notification text", () => {
+    expect(sanitizeTerminalNotificationText("line 1\nline 2\u0007")).toBe("line 1 line 2")
+  })
+
+  test("builds OSC 777 and OSC 99 sequences", () => {
+    expect(buildOsc777Sequence("pi", "done")).toBe("\x1b]777;notify;pi;done\x07")
+    expect(buildOsc99Sequences("pi", "done")).toEqual([
+      "\x1b]99;i=1:d=0;pi\x1b\\",
+      "\x1b]99;i=1:p=body;done\x1b\\",
+    ])
+  })
+
+  test("builds terminal notification sequences for each protocol", () => {
+    expect(buildTerminalNotificationSequences("osc777", "pi", "done")).toEqual(["\x1b]777;notify;pi;done\x07"])
+    expect(buildTerminalNotificationSequences("osc99", "pi", "done")).toEqual([
+      "\x1b]99;i=1:d=0;pi\x1b\\",
+      "\x1b]99;i=1:p=body;done\x1b\\",
+    ])
+  })
+
+  test("writes a terminal notification when supported", () => {
+    const writes: string[] = []
+    const writer = {
+      isTTY: true,
+      write(chunk: string) {
+        writes.push(chunk)
+      },
+    }
+
+    expect(sendTerminalNotification("pi", "done", { TERM_PROGRAM: "ghostty" }, writer)).toBeTrue()
+    expect(writes).toEqual(["\x1b]777;notify;pi;done\x07"])
+  })
+
+  test("falls back when no supported terminal transport is available", () => {
+    const writes: string[] = []
+    const writer = {
+      isTTY: true,
+      write(chunk: string) {
+        writes.push(chunk)
+      },
+    }
+
+    expect(sendTerminalNotification("pi", "done", { TERM_PROGRAM: "Apple_Terminal" }, writer)).toBeFalse()
+    expect(writes).toEqual([])
+  })
+})
+
+describe("escapeAppleScriptString", () => {
+  test("escapes backslashes and double quotes", () => {
+    expect(escapeAppleScriptString('say "hi" \\ now')).toBe('say \\"hi\\" \\\\ now')
+  })
+})
+
+describe("escapePowerShellString", () => {
+  test("escapes single quotes", () => {
+    expect(escapePowerShellString("Max's pi")).toBe("Max''s pi")
+  })
+})
+
+describe("buildWindowsNotificationScript", () => {
+  test("embeds escaped title and message", () => {
+    const script = buildWindowsNotificationScript("pi's title", "done's message")
+
+    expect(script).toContain("Add-Type -AssemblyName System.Windows.Forms")
+    expect(script).toContain("'pi''s title'")
+    expect(script).toContain("'done''s message'")
+    expect(script).toContain("$notification.ShowBalloonTip(3000")
+  })
+})
+
+describe("formatDuration", () => {
+  test("formats milliseconds, seconds, minutes, and hours", () => {
+    expect(formatDuration(850)).toBe("850ms")
+    expect(formatDuration(1_250)).toBe("1.3s")
+    expect(formatDuration(65_000)).toBe("1m 5s")
+    expect(formatDuration(3_600_000)).toBe("1h 0m")
+    expect(formatDuration(3_990_000)).toBe("1h 6m")
+  })
+})
+
+describe("buildAlertMessage", () => {
+  test("prioritizes updated files over every other activity", () => {
+    expect(
+      buildAlertMessage({
+        elapsedMs: 1_250,
+        writeCount: 2,
+        writtenPaths: ["src/alert.ts"],
+        readCount: 4,
+        readPaths: ["README.md", "package.json"],
+        otherToolCalls: ["bash", "grep"],
+      }),
+    ).toBe("Updated src/alert.ts in 1.3s")
+  })
+
+  test("summarizes other tool calls when nothing was written", () => {
+    expect(
+      buildAlertMessage({
+        elapsedMs: 4_200,
+        writeCount: 0,
+        writtenPaths: [],
+        readCount: 2,
+        readPaths: ["README.md"],
+        otherToolCalls: ["bash", "grep", "bash"],
+      }),
+    ).toBe("Ran 3 tool calls (bash, grep) in 4.2s")
+  })
+
+  test("summarizes read activity when it is the highest priority action", () => {
+    expect(
+      buildAlertMessage({
+        elapsedMs: 800,
+        writeCount: 0,
+        writtenPaths: [],
+        readCount: 2,
+        readPaths: ["README.md", "package.json"],
+        otherToolCalls: [],
+      }),
+    ).toBe("Read 2 files in 800ms")
+  })
+
+  test("falls back to a generic completion message", () => {
+    expect(
+      buildAlertMessage({
+        elapsedMs: 950,
+        writeCount: 0,
+        writtenPaths: [],
+        readCount: 0,
+        readPaths: [],
+        otherToolCalls: [],
+      }),
+    ).toBe("Finished in 950ms")
+  })
+})
+
+describe("summarizeAgentEndMessages", () => {
+  test("counts successful tool results by priority bucket", () => {
+    const summary = summarizeAgentEndMessages([
+      { role: "toolResult", toolCallId: "1", toolName: "read", content: [], isError: false, timestamp: 1 },
+      { role: "toolResult", toolCallId: "2", toolName: "edit", content: [], isError: false, timestamp: 2 },
+      { role: "toolResult", toolCallId: "3", toolName: "bash", content: [], isError: false, timestamp: 3 },
+      { role: "toolResult", toolCallId: "4", toolName: "write", content: [], isError: true, timestamp: 4 },
+    ])
+
+    expect(summary).toEqual({
+      elapsedMs: null,
+      writeCount: 1,
+      writtenPaths: [],
+      readCount: 1,
+      readPaths: [],
+      otherToolCalls: ["bash"],
+    })
+  })
+})
+
+describe("mergeAlertSummaries", () => {
+  test("uses fallback counts only when live data is missing", () => {
+    expect(
+      mergeAlertSummaries(
+        {
+          elapsedMs: 1_500,
+          writeCount: 1,
+          writtenPaths: ["src/alert.ts"],
+          readCount: 0,
+          readPaths: [],
+          otherToolCalls: [],
+        },
+        {
+          elapsedMs: null,
+          writeCount: 2,
+          writtenPaths: [],
+          readCount: 3,
+          readPaths: [],
+          otherToolCalls: ["bash"],
+        },
+      ),
+    ).toEqual({
+      elapsedMs: 1_500,
+      writeCount: 1,
+      writtenPaths: ["src/alert.ts"],
+      readCount: 3,
+      readPaths: [],
+      otherToolCalls: ["bash"],
+    })
+  })
+})
+
+describe("buildNotificationCommands", () => {
+  test("builds a macOS notification command", () => {
+    expect(buildNotificationCommands("darwin", "pi", 'hello "world"')).toEqual([
+      {
+        command: "osascript",
+        args: ["-e", 'display notification "hello \\"world\\"" with title "pi" sound name "Glass"'],
+      },
+    ])
+  })
+
+  test("builds a Linux notification command", () => {
+    expect(buildNotificationCommands("linux", "pi", "done")).toEqual([
+      {
+        command: "notify-send",
+        args: ["--app-name=pi", "--expire-time=5000", "pi", "done"],
+      },
+    ])
+  })
+
+  test("builds Windows notification commands", () => {
+    const commands = buildNotificationCommands("win32", "pi", "done")
+
+    expect(commands).toHaveLength(2)
+    expect(commands[0]?.command).toBe("powershell")
+    expect(commands[1]?.command).toBe("pwsh")
+    expect(commands[0]?.args.at(-1)).toContain("$notification.ShowBalloonTip(3000")
+  })
+
+  test("returns no commands for unsupported platforms", () => {
+    expect(buildNotificationCommands("aix", "pi", "done")).toEqual([])
+  })
+})
