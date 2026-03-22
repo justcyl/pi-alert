@@ -1,31 +1,54 @@
 import { describe, expect, test } from "bun:test"
 import {
   buildAlertMessage,
+  buildAlertTitle,
   buildNotificationCommands,
   buildOsc777Sequence,
+  buildOsc9Sequence,
   buildOsc99Sequences,
   buildTerminalNotificationSequences,
   buildWindowsNotificationScript,
+  detectTerminalNotificationTargetFromEnv,
   detectTerminalNotificationTransport,
   escapeAppleScriptString,
   escapePowerShellString,
   formatDuration,
+  parseTmuxAllowPassthrough,
   mergeAlertSummaries,
   sanitizeTerminalNotificationText,
+  sendTerminalBell,
   sendTerminalNotification,
   summarizeAgentEndMessages,
+  wrapTmuxPassthroughSequence,
 } from "./alert"
 
 describe("terminal notifications", () => {
   test("detects OSC 777 terminals", () => {
     expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "ghostty" }, true)).toBe("osc777")
-    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "iTerm.app" }, true)).toBe("osc777")
     expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "WezTerm" }, true)).toBe("osc777")
     expect(detectTerminalNotificationTransport({ TERM: "rxvt-unicode-256color" }, true)).toBe("osc777")
   })
 
+  test("detects iTerm2", () => {
+    expect(detectTerminalNotificationTransport({ TERM_PROGRAM: "iTerm.app" }, true)).toBe("osc9")
+    expect(detectTerminalNotificationTransport({ ITERM_SESSION_ID: "w0t0p0" }, true)).toBe("osc9")
+    expect(detectTerminalNotificationTransport({ LC_TERMINAL: "iTerm2" }, true)).toBe("osc9")
+  })
+
   test("detects Kitty", () => {
     expect(detectTerminalNotificationTransport({ KITTY_WINDOW_ID: "12" }, true)).toBe("osc99")
+  })
+
+  test("marks terminal notifications for tmux passthrough when supported", () => {
+    expect(detectTerminalNotificationTargetFromEnv({ TERM_PROGRAM: "ghostty", TMUX: "1" }, true)).toEqual({
+      transport: "osc777",
+      viaTmux: true,
+    })
+
+    expect(detectTerminalNotificationTargetFromEnv({ KITTY_WINDOW_ID: "12", TMUX: "1" }, true)).toEqual({
+      transport: "osc99",
+      viaTmux: true,
+    })
   })
 
   test("returns null when stdout is not a tty or terminal is unsupported", () => {
@@ -39,6 +62,7 @@ describe("terminal notifications", () => {
 
   test("builds OSC 777 and OSC 99 sequences", () => {
     expect(buildOsc777Sequence("pi", "done")).toBe("\x1b]777;notify;pi;done\x07")
+    expect(buildOsc9Sequence("pi: done")).toBe("\x1b]9;pi: done\x07")
     expect(buildOsc99Sequences("pi", "done")).toEqual([
       "\x1b]99;i=1:d=0;pi\x1b\\",
       "\x1b]99;i=1:p=body;done\x1b\\",
@@ -47,10 +71,17 @@ describe("terminal notifications", () => {
 
   test("builds terminal notification sequences for each protocol", () => {
     expect(buildTerminalNotificationSequences("osc777", "pi", "done")).toEqual(["\x1b]777;notify;pi;done\x07"])
+    expect(buildTerminalNotificationSequences("osc9", "pi", "done")).toEqual(["\x1b]9;pi: done\x07"])
     expect(buildTerminalNotificationSequences("osc99", "pi", "done")).toEqual([
       "\x1b]99;i=1:d=0;pi\x1b\\",
       "\x1b]99;i=1:p=body;done\x1b\\",
     ])
+  })
+
+  test("wraps OSC sequences for tmux passthrough", () => {
+    expect(wrapTmuxPassthroughSequence("\x1b]777;notify;pi;done\x07")).toBe(
+      "\x1bPtmux;\x1b\x1b]777;notify;pi;done\x07\x1b\\",
+    )
   })
 
   test("writes a terminal notification when supported", () => {
@@ -66,6 +97,25 @@ describe("terminal notifications", () => {
     expect(writes).toEqual(["\x1b]777;notify;pi;done\x07"])
   })
 
+  test("writes tmux passthrough sequences when requested", () => {
+    const writes: string[] = []
+    const writer = {
+      isTTY: true,
+      write(chunk: string) {
+        writes.push(chunk)
+      },
+    }
+
+    expect(
+      sendTerminalNotification("pi", "done", { TERM_PROGRAM: "tmux", TMUX: "1" }, writer, {
+        transport: "osc777",
+        viaTmux: true,
+      }),
+    ).toBeTrue()
+
+    expect(writes).toEqual(["\x1bPtmux;\x1b\x1b]777;notify;pi;done\x07\x1b\\"])
+  })
+
   test("falls back when no supported terminal transport is available", () => {
     const writes: string[] = []
     const writer = {
@@ -76,6 +126,32 @@ describe("terminal notifications", () => {
     }
 
     expect(sendTerminalNotification("pi", "done", { TERM_PROGRAM: "Apple_Terminal" }, writer)).toBeFalse()
+    expect(writes).toEqual([])
+  })
+
+  test("rings the terminal bell as a last-resort fallback", () => {
+    const writes: string[] = []
+    const writer = {
+      isTTY: true,
+      write(chunk: string) {
+        writes.push(chunk)
+      },
+    }
+
+    expect(sendTerminalBell(writer)).toBeTrue()
+    expect(writes).toEqual(["\x07"])
+  })
+
+  test("does not ring the terminal bell when stdout is not a tty", () => {
+    const writes: string[] = []
+    const writer = {
+      isTTY: false,
+      write(chunk: string) {
+        writes.push(chunk)
+      },
+    }
+
+    expect(sendTerminalBell(writer)).toBeFalse()
     expect(writes).toEqual([])
   })
 })
@@ -103,10 +179,26 @@ describe("buildWindowsNotificationScript", () => {
   })
 })
 
+describe("buildAlertTitle", () => {
+  test("formats the title with the project root directory name", () => {
+    expect(buildAlertTitle("/Users/max/dev/pi-alert")).toBe("pi — pi-alert")
+    expect(buildAlertTitle("/Users/max/dev/pi-alert/")).toBe("pi — pi-alert")
+    expect(buildAlertTitle(undefined)).toBe("pi")
+  })
+})
+
+describe("parseTmuxAllowPassthrough", () => {
+  test("detects whether tmux passthrough is enabled", () => {
+    expect(parseTmuxAllowPassthrough("on\n")).toBeTrue()
+    expect(parseTmuxAllowPassthrough("off\n")).toBeFalse()
+  })
+})
+
 describe("formatDuration", () => {
   test("formats milliseconds, seconds, minutes, and hours", () => {
     expect(formatDuration(850)).toBe("850ms")
-    expect(formatDuration(1_250)).toBe("1.3s")
+    expect(formatDuration(1_250)).toBe("1s")
+    expect(formatDuration(14_900)).toBe("14s")
     expect(formatDuration(65_000)).toBe("1m 5s")
     expect(formatDuration(3_600_000)).toBe("1h 0m")
     expect(formatDuration(3_990_000)).toBe("1h 6m")
@@ -124,7 +216,7 @@ describe("buildAlertMessage", () => {
         readPaths: ["README.md", "package.json"],
         otherToolCalls: ["bash", "grep"],
       }),
-    ).toBe("Updated 1 file in 1.3s")
+    ).toBe("Updated 1 file in 1s")
   })
 
   test("summarizes other tool calls when nothing was written", () => {
@@ -137,7 +229,7 @@ describe("buildAlertMessage", () => {
         readPaths: ["README.md"],
         otherToolCalls: ["bash", "grep", "bash"],
       }),
-    ).toBe("Ran 3 tool calls (bash, grep) in 4.2s")
+    ).toBe("Ran 3 tool calls (bash, grep) in 4s")
   })
 
   test("summarizes read activity when it is the highest priority action", () => {

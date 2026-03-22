@@ -1,7 +1,8 @@
 import { platform } from "node:os"
+import { basename } from "node:path"
 import type { AgentEndEvent, ExtensionAPI } from "@mariozechner/pi-coding-agent"
 
-const TITLE = "pi"
+const APP_NAME = "pi"
 const FALLBACK_MESSAGE = "Agent finished its turn"
 const NOTIFICATION_TIMEOUT_MS = 5_000
 
@@ -10,7 +11,12 @@ export type NotificationCommand = {
   args: string[]
 }
 
-export type TerminalNotificationTransport = "osc777" | "osc99"
+export type TerminalNotificationTransport = "osc777" | "osc99" | "osc9"
+
+export type TerminalNotificationTarget = {
+  transport: TerminalNotificationTransport
+  viaTmux: boolean
+}
 
 export type TerminalWriter = {
   isTTY?: boolean
@@ -74,13 +80,14 @@ export default function alertExtension(pi: ExtensionAPI) {
     recordCompletedToolExecution(currentRun, pendingToolCall?.toolName ?? event.toolName, pendingToolCall?.path ?? null)
   })
 
-  pi.on("agent_end", async (event) => {
+  pi.on("agent_end", async (event, ctx) => {
     const liveSummary = snapshotRunState(currentRun)
     const fallbackSummary = summarizeAgentEndMessages(event.messages)
     const message = buildAlertMessage(mergeAlertSummaries(liveSummary, fallbackSummary))
+    const title = buildAlertTitle(ctx.cwd)
 
     currentRun = null
-    await notifyBestAvailable(pi, TITLE, message)
+    await notifyBestAvailable(pi, title, message)
   })
 }
 
@@ -179,11 +186,16 @@ export function mergeAlertSummaries(primary: AlertSummaryInput, fallback: AlertS
 }
 
 async function notifyBestAvailable(pi: ExtensionAPI, title: string, message: string): Promise<void> {
-  if (sendTerminalNotification(title, message)) {
+  const target = await detectTerminalNotificationTarget(pi, process.env, process.stdout.isTTY === true)
+  if (sendTerminalNotification(title, message, process.env, process.stdout, target)) {
     return
   }
 
-  await notifyCurrentPlatform(pi, title, message)
+  if (await notifyCurrentPlatform(pi, title, message)) {
+    return
+  }
+
+  sendTerminalBell(process.stdout)
 }
 
 export function sendTerminalNotification(
@@ -191,13 +203,16 @@ export function sendTerminalNotification(
   message: string,
   env: NodeJS.ProcessEnv = process.env,
   writer: TerminalWriter = process.stdout,
+  target: TerminalNotificationTarget | null = detectTerminalNotificationTargetFromEnv(env, writer.isTTY === true),
 ): boolean {
-  const transport = detectTerminalNotificationTransport(env, writer.isTTY === true)
-  if (!transport) {
+  if (!target) {
     return false
   }
 
-  const sequences = buildTerminalNotificationSequences(transport, title, message)
+  const sequences = buildTerminalNotificationSequences(target.transport, title, message).map((sequence) =>
+    target.viaTmux ? wrapTmuxPassthroughSequence(sequence) : sequence,
+  )
+
   for (const sequence of sequences) {
     writer.write(sequence)
   }
@@ -209,21 +224,142 @@ export function detectTerminalNotificationTransport(
   env: NodeJS.ProcessEnv,
   isTTY: boolean,
 ): TerminalNotificationTransport | null {
+  return detectTerminalNotificationTargetFromEnv(env, isTTY)?.transport ?? null
+}
+
+export function detectTerminalNotificationTargetFromEnv(
+  env: NodeJS.ProcessEnv,
+  isTTY: boolean,
+): TerminalNotificationTarget | null {
   if (!isTTY) {
     return null
   }
 
-  if (env.KITTY_WINDOW_ID) {
+  const transport = detectTerminalNotificationTransportFromTerminalMetadata({
+    kittyWindowId: env.KITTY_WINDOW_ID,
+    itermSessionId: env.ITERM_SESSION_ID,
+    lcTerminal: env.LC_TERMINAL,
+    termProgram: env.TERM_PROGRAM,
+    term: env.TERM,
+  })
+
+  if (!transport) {
+    return null
+  }
+
+  return {
+    transport,
+    viaTmux: typeof env.TMUX === "string" && env.TMUX.length > 0,
+  }
+}
+
+async function detectTerminalNotificationTarget(
+  pi: ExtensionAPI,
+  env: NodeJS.ProcessEnv,
+  isTTY: boolean,
+): Promise<TerminalNotificationTarget | null> {
+  const directTarget = detectTerminalNotificationTargetFromEnv(env, isTTY)
+  if (directTarget && !directTarget.viaTmux) {
+    return directTarget
+  }
+
+  if (!isTTY || !env.TMUX) {
+    return directTarget
+  }
+
+  if (!(await isTmuxPassthroughEnabled(pi))) {
+    return null
+  }
+
+  const tmuxTransport = await detectTmuxTerminalNotificationTransport(pi)
+  if (!tmuxTransport) {
+    return null
+  }
+
+  return {
+    transport: tmuxTransport,
+    viaTmux: true,
+  }
+}
+
+async function detectTmuxTerminalNotificationTransport(pi: ExtensionAPI): Promise<TerminalNotificationTransport | null> {
+  try {
+    const result = await pi.exec(
+      "tmux",
+      ["display-message", "-p", "#{client_termname}\n#{client_termtype}"],
+      { timeout: 1_000 },
+    )
+
+    if (result.code !== 0) {
+      return null
+    }
+
+    const [clientTermName = "", clientTermType = ""] = result.stdout.split(/\r?\n/, 2)
+    return detectTerminalNotificationTransportFromTerminalMetadata({
+      termProgram: clientTermName,
+      term: clientTermType,
+    })
+  } catch {
+    return null
+  }
+}
+
+async function isTmuxPassthroughEnabled(pi: ExtensionAPI): Promise<boolean> {
+  try {
+    const result = await pi.exec("tmux", ["show", "-gv", "allow-passthrough"], { timeout: 1_000 })
+    if (result.code !== 0) {
+      return false
+    }
+
+    return parseTmuxAllowPassthrough(result.stdout)
+  } catch {
+    return false
+  }
+}
+
+export function parseTmuxAllowPassthrough(output: string): boolean {
+  return output.trim().toLowerCase() === "on"
+}
+
+function detectTerminalNotificationTransportFromTerminalMetadata(metadata: {
+  kittyWindowId?: string | undefined
+  itermSessionId?: string | undefined
+  lcTerminal?: string | undefined
+  termProgram?: string | undefined
+  term?: string | undefined
+}): TerminalNotificationTransport | null {
+  if (metadata.kittyWindowId) {
     return "osc99"
   }
 
-  const termProgram = env.TERM_PROGRAM?.toLowerCase()
-  if (termProgram === "ghostty" || termProgram === "iterm.app" || termProgram === "wezterm") {
+  if (metadata.itermSessionId) {
+    return "osc9"
+  }
+
+  const lcTerminal = metadata.lcTerminal?.toLowerCase()
+  if (lcTerminal === "iterm2") {
+    return "osc9"
+  }
+
+  const termProgram = metadata.termProgram?.toLowerCase()
+  if (termProgram === "iterm.app") {
+    return "osc9"
+  }
+
+  if (termProgram === "ghostty" || termProgram === "wezterm") {
     return "osc777"
   }
 
-  const term = env.TERM?.toLowerCase() ?? ""
-  if (term.includes("rxvt")) {
+  const term = metadata.term?.toLowerCase() ?? ""
+  if (term.includes("kitty")) {
+    return "osc99"
+  }
+
+  if (term.includes("iterm")) {
+    return "osc9"
+  }
+
+  if (term.includes("ghostty") || term.includes("wezterm") || term.includes("rxvt")) {
     return "osc777"
   }
 
@@ -244,6 +380,9 @@ export function buildTerminalNotificationSequences(
 
     case "osc99":
       return buildOsc99Sequences(safeTitle, safeMessage)
+
+    case "osc9":
+      return [buildOsc9Sequence(formatOsc9Message(safeTitle, safeMessage))]
   }
 }
 
@@ -251,17 +390,38 @@ export function buildOsc777Sequence(title: string, message: string): string {
   return `\x1b]777;notify;${title};${message}\x07`
 }
 
+export function buildOsc9Sequence(message: string): string {
+  return `\x1b]9;${message}\x07`
+}
+
 export function buildOsc99Sequences(title: string, message: string): [string, string] {
   return [`\x1b]99;i=1:d=0;${title}\x1b\\`, `\x1b]99;i=1:p=body;${message}\x1b\\`]
+}
+
+function formatOsc9Message(title: string, message: string): string {
+  return `${title}: ${message}`
+}
+
+export function wrapTmuxPassthroughSequence(sequence: string): string {
+  return `\x1bPtmux;${sequence.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`
 }
 
 export function sanitizeTerminalNotificationText(value: string): string {
   return value.replaceAll(/[\u0000-\u001f\u007f]+/g, " ").trim()
 }
 
-async function notifyCurrentPlatform(pi: ExtensionAPI, title: string, message: string): Promise<void> {
+export function sendTerminalBell(writer: TerminalWriter = process.stdout): boolean {
+  if (writer.isTTY !== true) {
+    return false
+  }
+
+  writer.write("\x07")
+  return true
+}
+
+async function notifyCurrentPlatform(pi: ExtensionAPI, title: string, message: string): Promise<boolean> {
   const commands = buildNotificationCommands(platform(), title, message)
-  await execFirstAvailable(pi, commands)
+  return execFirstAvailable(pi, commands)
 }
 
 export function buildNotificationCommands(
@@ -313,12 +473,14 @@ export function buildNotificationCommands(
   }
 }
 
-async function execFirstAvailable(pi: ExtensionAPI, commands: NotificationCommand[]): Promise<void> {
+async function execFirstAvailable(pi: ExtensionAPI, commands: NotificationCommand[]): Promise<boolean> {
   for (const command of commands) {
     if (await tryCommand(pi, command)) {
-      return
+      return true
     }
   }
+
+  return false
 }
 
 async function tryCommand(pi: ExtensionAPI, command: NotificationCommand): Promise<boolean> {
@@ -346,6 +508,16 @@ function getPathArg(args: unknown): string | null {
 function normalizeToolPath(path: string): string | null {
   const normalizedPath = path.trim().replace(/^@/, "")
   return normalizedPath ? normalizedPath : null
+}
+
+export function buildAlertTitle(cwd: string | null | undefined): string {
+  if (!cwd) {
+    return APP_NAME
+  }
+
+  const normalizedCwd = cwd.replace(/[\\/]+$/, "") || cwd
+  const rootDir = basename(normalizedCwd)
+  return rootDir ? `${APP_NAME} — ${rootDir}` : APP_NAME
 }
 
 export function buildAlertMessage(summary: AlertSummaryInput): string {
@@ -400,7 +572,7 @@ export function formatDuration(elapsedMs: number): string {
 
   const seconds = elapsedMs / 1_000
   if (seconds < 60) {
-    return `${seconds.toFixed(1)}s`
+    return `${Math.floor(seconds)}s`
   }
 
   const totalMinutes = Math.floor(seconds / 60)
